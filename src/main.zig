@@ -725,6 +725,18 @@ const Daemon = struct {
         self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
     }
+
+    pub fn handleSwitch(self: *Daemon, target_session: []const u8) void {
+        std.log.info("switch request to session={s}", .{target_session});
+        // Broadcast Switch message to all connected clients
+        for (self.clients.items) |client| {
+            ipc.appendMessage(self.alloc, &client.write_buf, .Switch, target_session) catch |err| {
+                std.log.warn("failed to buffer switch for client err={s}", .{@errorName(err)});
+                continue;
+            };
+            client.has_pending_output = true;
+        }
+    }
 };
 
 fn printVersion(cfg: *Cfg) !void {
@@ -1068,28 +1080,50 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     }
 }
 
+fn sendSwitchRequest(daemon: *Daemon, current_sesh: []const u8) !void {
+    // Build socket path for current session
+    const current_socket_path = try socket.getSocketPath(
+        daemon.alloc,
+        daemon.cfg.socket_dir,
+        current_sesh,
+    );
+    defer daemon.alloc.free(current_socket_path);
+
+    // Connect to current session's daemon and send Switch message
+    const fd = try socket.sessionConnect(current_socket_path);
+    defer posix.close(fd);
+    try ipc.send(fd, .Switch, daemon.session_name);
+}
+
+fn printErr(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print(fmt, args) catch {};
+    w.interface.flush() catch {};
+}
+
 fn attach(daemon: *Daemon) !void {
-    const sesh = socket.getSeshNameFromEnv();
-    if (sesh.len > 0) {
-        return error.CannotAttachToSessionInSession;
+    const current_sesh = socket.getSeshNameFromEnv();
+    if (current_sesh.len > 0) {
+        // Inside a session - send switch request to current daemon
+        if (std.mem.eql(u8, current_sesh, daemon.session_name)) {
+            // Already in target session
+            std.log.info("already attached to session={s}", .{daemon.session_name});
+            return;
+        }
+        try sendSwitchRequest(daemon, current_sesh);
+        return;
     }
 
+    // Initial session setup - ensure session exists or create it
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
 
-    const client_sock = try socket.sessionConnect(daemon.socket_path);
-    std.log.info("attached session={s}", .{daemon.session_name});
-    //  This is typically used with tcsetattr() to modify terminal settings.
-    //      - you first get the current settings with tcgetattr()
-    //      - modify the desired attributes in the termios structure
-    //      - then apply the changes with tcsetattr().
-    //  This prevents unintended side effects by preserving other settings.
-    // restore stdin fd to its original state after exiting.
-    // Use TCSAFLUSH to discard any unread input, preventing stale input after detach.
-    //
-    // tcgetattr fails when stdin is not a TTY (e.g. piped). In that case,
-    // skip terminal setup entirely rather than applying undefined stack bytes
-    // via tcsetattr.
+    var current_socket_path = daemon.socket_path;
+    var socket_path_allocated = false;
+    defer if (socket_path_allocated) daemon.alloc.free(current_socket_path);
+
+    // Terminal setup - save original state
     var orig_termios: cross.c.termios = undefined;
     const stdin_is_tty = cross.c.tcgetattr(posix.STDIN_FILENO, &orig_termios) == 0;
 
@@ -1130,12 +1164,50 @@ fn attach(daemon: *Daemon) !void {
         _ = cross.c.tcsetattr(posix.STDIN_FILENO, cross.c.TCSANOW, &raw_termios);
     }
 
-    // Clear screen before attaching. This provides a clean slate before
-    // the session restore.
-    const clear_seq = "\x1b[2J\x1b[H";
-    _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
+    // Main attach loop - allows switching to different sessions
+    attach_loop: while (true) {
+        const client_sock = try socket.sessionConnect(current_socket_path);
+        std.log.info("attached socket_path={s}", .{current_socket_path});
 
-    try clientLoop(client_sock);
+        // Clear screen before attaching. This provides a clean slate before
+        // the session restore.
+        const clear_seq = "\x1b[2J\x1b[H";
+        _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
+
+        const switch_target = try clientLoop(client_sock) orelse break :attach_loop;
+        defer daemon.alloc.free(switch_target);
+
+        // Validate target session exists
+        var dir = std.fs.openDirAbsolute(daemon.cfg.socket_dir, .{}) catch {
+            printErr("error: cannot open socket directory\n", .{});
+            break :attach_loop;
+        };
+        defer dir.close();
+
+        const exists = socket.sessionExists(dir, switch_target) catch false;
+        if (!exists) {
+            printErr("error: session \"{s}\" does not exist\n", .{switch_target});
+            break :attach_loop;
+        }
+
+        // Prepare for next iteration - switch to the target session
+        if (socket_path_allocated) {
+            daemon.alloc.free(current_socket_path);
+        }
+        current_socket_path = socket.getSocketPath(
+            daemon.alloc,
+            daemon.cfg.socket_dir,
+            switch_target,
+        ) catch |err| switch (err) {
+            error.NameTooLong => {
+                socket.printSessionNameTooLong(switch_target, daemon.cfg.socket_dir);
+                break :attach_loop;
+            },
+            error.OutOfMemory => return err,
+        };
+        socket_path_allocated = true;
+        std.log.info("switching to session={s}", .{switch_target});
+    }
 }
 
 fn run(daemon: *Daemon, command_args: [][]const u8) !void {
@@ -1271,7 +1343,8 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32) !void {
+/// Returns the target session name if a switch was requested, or null otherwise.
+fn clientLoop(client_sock_fd: i32) !?[]const u8 {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -1367,7 +1440,7 @@ fn clientLoop(client_sock_fd: i32) !void {
                     }
                 } else {
                     // EOF on stdin
-                    return;
+                    return null;
                 }
             }
         }
@@ -1377,13 +1450,13 @@ fn clientLoop(client_sock_fd: i32) !void {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                    return;
+                    return null;
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
                 return err;
             };
             if (n == 0) {
-                return; // Server closed connection
+                return null; // Server closed connection
             }
 
             while (read_buf.next()) |msg| {
@@ -1392,6 +1465,13 @@ fn clientLoop(client_sock_fd: i32) !void {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(alloc, msg.payload);
                         }
+                    },
+                    .Switch => {
+                        // Store target session name and exit loop
+                        if (msg.payload.len > 0) {
+                            return try alloc.dupe(u8, msg.payload);
+                        }
+                        return null;
                     },
                     else => {},
                 }
@@ -1404,7 +1484,7 @@ fn clientLoop(client_sock_fd: i32) !void {
                 const n = posix.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                        return;
+                        return null;
                     }
                     return err;
                 };
@@ -1425,9 +1505,10 @@ fn clientLoop(client_sock_fd: i32) !void {
         }
 
         if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-            return;
+            return null;
         }
     }
+    return null;
 }
 
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
@@ -1621,6 +1702,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
+                        .Switch => {
+                            daemon.handleSwitch(msg.payload);
+                            break :clients_loop;
+                        },
                         .Output, .Ack => {},
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
